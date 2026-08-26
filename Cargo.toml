@@ -1,0 +1,16 @@
+[package]
+name = "corpo-metrics-chatbot"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal UI chat client for the Claude API, wired to a remote MCP server."
+license = "MIT"
+
+[[bin]]
+name = "corpo-metrics-chatbot"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -1,0 +1,18 @@
+/target
+Cargo.lock.bak
+*.log
+
+# environment / secrets
+.env
+.env.*
+!.env.example
+
+# editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# nix
+result
+result-*
