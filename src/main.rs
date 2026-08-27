@@ -1,3 +1,4 @@
+mod claude;
 mod config;
 
 use config::Config;
