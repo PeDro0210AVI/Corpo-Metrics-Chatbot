@@ -111,7 +111,14 @@ impl ClaudeClient {
 
         let mut finished_blocks: Vec<Value> = Vec::new();
         let mut current_block: Option<Value> = None;
+        // Accumulators for the block currently being streamed. Which ones
+        // apply depends on the block's type: "text" fills current_text via
+        // text_delta, "thinking" fills current_text via thinking_delta and
+        // current_signature via signature_delta, "mcp_tool_use"/"tool_use"
+        // fills current_partial_json via input_json_delta.
         let mut current_text = String::new();
+        let mut current_signature = String::new();
+        let mut current_partial_json = String::new();
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = match chunk {
@@ -163,26 +170,73 @@ impl ClaudeClient {
                         }
 
                         current_text.clear();
+                        current_signature.clear();
+                        current_partial_json.clear();
                         current_block = Some(block);
                     }
                     "content_block_delta" => {
                         if let Some(delta) = event.get("delta") {
-                            if delta.get("type").and_then(Value::as_str) == Some("text_delta") {
-                                if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                                    current_text.push_str(text);
-                                    let _ = tx.send(ApiEvent::TextDelta(text.to_string()));
+                            match delta.get("type").and_then(Value::as_str) {
+                                Some("text_delta") => {
+                                    if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                                        current_text.push_str(text);
+                                        let _ = tx.send(ApiEvent::TextDelta(text.to_string()));
+                                    }
                                 }
+                                Some("thinking_delta") => {
+                                    if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                                        current_text.push_str(text);
+                                    }
+                                }
+                                Some("signature_delta") => {
+                                    if let Some(sig) = delta.get("signature").and_then(Value::as_str) {
+                                        current_signature.push_str(sig);
+                                    }
+                                }
+                                Some("input_json_delta") => {
+                                    if let Some(fragment) =
+                                        delta.get("partial_json").and_then(Value::as_str)
+                                    {
+                                        current_partial_json.push_str(fragment);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
                     "content_block_stop" => {
                         if let Some(mut block) = current_block.take() {
-                            if block.get("type").and_then(Value::as_str) == Some("text") {
-                                block["text"] = json!(current_text);
+                            match block.get("type").and_then(Value::as_str) {
+                                Some("text") => {
+                                    block["text"] = json!(current_text);
+                                }
+                                Some("thinking") => {
+                                    // The API rejects a replayed thinking block whose
+                                    // "thinking" field is missing, even if empty (the
+                                    // default when display isn't "summarized") — always
+                                    // set it explicitly. Only attach a signature if one
+                                    // actually streamed back.
+                                    block["thinking"] = json!(current_text);
+                                    if !current_signature.is_empty() {
+                                        block["signature"] = json!(current_signature);
+                                    }
+                                }
+                                Some("mcp_tool_use") | Some("tool_use") => {
+                                    if !current_partial_json.is_empty() {
+                                        if let Ok(parsed) =
+                                            serde_json::from_str::<Value>(&current_partial_json)
+                                        {
+                                            block["input"] = parsed;
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                             finished_blocks.push(block);
                         }
                         current_text.clear();
+                        current_signature.clear();
+                        current_partial_json.clear();
                     }
                     "error" => {
                         let msg = event
