@@ -1,3 +1,4 @@
+mod app;
 mod claude;
 mod config;
 
