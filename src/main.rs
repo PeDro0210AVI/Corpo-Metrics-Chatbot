@@ -57,7 +57,10 @@ async fn run(
     config: &Config,
     client: Arc<ClaudeClient>,
 ) -> Result<()> {
-    let mut app = App::new(config);
+    // TODO: connect the real local servers at startup instead of an empty
+    // placeholder — comes with the rest of the startup wiring.
+    let placeholder_local = local_mcp::LocalMcpRegistry::connect(vec![]).await;
+    let mut app = App::new(config, &placeholder_local);
 
     let (tx, mut rx) = unbounded_channel::<LoopEvent>();
 
@@ -149,7 +152,11 @@ fn spawn_request(
         let (api_tx, mut api_rx) = unbounded_channel::<ApiEvent>();
 
         tokio::spawn(async move {
-            client.stream_reply(history, api_tx).await;
+            // TODO: thread a shared registry through from startup instead of
+            // reconnecting per request (empty specs here means no local
+            // tools yet — this just gets the new call site compiling).
+            let local = local_mcp::LocalMcpRegistry::connect(vec![]).await;
+            client.run_turn(history, &local, api_tx).await;
         });
 
         while let Some(event) = api_rx.recv().await {

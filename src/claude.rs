@@ -3,28 +3,41 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::Config;
+use crate::local_mcp::LocalMcpRegistry;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// Beta flag for the MCP connector: lets Claude call tools on a remote MCP
-/// server directly from the Messages API (no local MCP client needed).
+/// Beta flag for the MCP connector: lets Claude call tools on the remote MCP
+/// server directly from the Messages API (no local MCP client needed for it).
 const MCP_CONNECTOR_BETA: &str = "mcp-client-2025-11-20";
+/// Safety cap on client-side tool-use round trips per user message, so a
+/// misbehaving local tool (or a model stuck calling it) can't loop forever.
+const MAX_TOOL_ROUNDS: u32 = 10;
 
-/// Events streamed back from a single Claude API call, consumed by the UI loop.
+/// Events streamed back from a conversation turn, consumed by the UI loop.
 #[derive(Debug, Clone)]
 pub enum ApiEvent {
     /// A chunk of assistant text to append to the in-progress reply.
     TextDelta(String),
-    /// Claude is invoking a tool on the connected MCP server.
+    /// Claude is invoking a tool (remote MCP or a local one).
     ToolUse { name: String },
-    /// Result of an MCP tool call came back.
+    /// Result of a *remote* MCP tool call came back (handled entirely
+    /// server-side by Anthropic). Local tool results aren't streamed back
+    /// this way — see `ToolResult` usage in `run_turn`.
     ToolResult { is_error: bool },
-    /// The turn finished. Carries the raw content blocks so the full
-    /// assistant turn (including tool_use/tool_result blocks) can be
-    /// replayed as history on the next request.
-    Done { content: Vec<Value> },
+    /// The whole turn (including any client-side tool round trips) is done.
+    /// Carries every message appended along the way — one or more
+    /// assistant/user pairs — so the caller can extend its history in order.
+    Done { new_messages: Vec<Value> },
     /// Something went wrong (network, API error, refusal, etc).
     Error(String),
+}
+
+/// One streamed turn's outcome: the finished content blocks and why the
+/// model stopped.
+struct StepResult {
+    content: Vec<Value>,
+    stop_reason: String,
 }
 
 pub struct ClaudeClient {
@@ -50,7 +63,7 @@ impl ClaudeClient {
         }
     }
 
-    fn build_body(&self, messages: &[Value]) -> Value {
+    fn build_body(&self, messages: &[Value], local_tool_defs: &[Value]) -> Value {
         let mut mcp_server = json!({
             "type": "url",
             "name": self.mcp_server_name,
@@ -60,23 +73,105 @@ impl ClaudeClient {
             mcp_server["authorization_token"] = json!(token);
         }
 
+        let mut tools = vec![json!({
+            "type": "mcp_toolset",
+            "mcp_server_name": self.mcp_server_name
+        })];
+        tools.extend(local_tool_defs.iter().cloned());
+
         json!({
             "model": self.model,
             "max_tokens": self.max_tokens,
             "stream": true,
             "mcp_servers": [mcp_server],
-            "tools": [
-                { "type": "mcp_toolset", "mcp_server_name": self.mcp_server_name }
-            ],
+            "tools": tools,
             "messages": messages,
         })
     }
 
-    /// Sends the full conversation history and streams the reply, forwarding
-    /// `ApiEvent`s to `tx` as they arrive. Runs to completion on the calling
-    /// task — callers spawn this on its own tokio task.
-    pub async fn stream_reply(&self, messages: Vec<Value>, tx: UnboundedSender<ApiEvent>) {
-        let body = self.build_body(&messages);
+    /// Drives one full user turn to completion, including any client-side
+    /// tool round trips against `local`: whenever the model calls a tool
+    /// that isn't the remote MCP server (which Anthropic resolves on its
+    /// own), we execute it locally, feed the result back, and continue.
+    /// Emits `ApiEvent`s to `tx` throughout; sends exactly one `Done` or
+    /// `Error` at the end.
+    pub async fn run_turn(
+        &self,
+        mut history: Vec<Value>,
+        local: &LocalMcpRegistry,
+        tx: UnboundedSender<ApiEvent>,
+    ) {
+        let local_tool_defs = local.tool_defs();
+        let mut new_messages: Vec<Value> = Vec::new();
+
+        for _ in 0..MAX_TOOL_ROUNDS {
+            let Some(step) = self.stream_once(&history, local_tool_defs, &tx).await else {
+                // stream_once already reported the error.
+                return;
+            };
+
+            let assistant_message = json!({"role": "assistant", "content": step.content});
+            history.push(assistant_message.clone());
+            new_messages.push(assistant_message);
+
+            if step.stop_reason != "tool_use" {
+                break;
+            }
+
+            let pending: Vec<(String, String, Value)> = step
+                .content
+                .iter()
+                .filter_map(|block| {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                        return None;
+                    }
+                    let id = block.get("id")?.as_str()?.to_string();
+                    let name = block.get("name")?.as_str()?.to_string();
+                    let input = block.get("input").cloned().unwrap_or(json!({}));
+                    Some((id, name, input))
+                })
+                .filter(|(_, name, _)| local.is_local_tool(name))
+                .collect();
+
+            if pending.is_empty() {
+                // Nothing here is one of our local tools (e.g. it was an
+                // mcp_tool_use, which Anthropic already resolved and would
+                // have carried a different stop_reason) — nothing more we
+                // can do.
+                break;
+            }
+
+            let mut tool_results = Vec::with_capacity(pending.len());
+            for (id, name, input) in pending {
+                let (text, is_error) = local.call(&name, input).await;
+                let _ = tx.send(ApiEvent::ToolResult { is_error });
+                tool_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "content": text,
+                    "is_error": is_error,
+                }));
+            }
+
+            let user_message = json!({"role": "user", "content": tool_results});
+            history.push(user_message.clone());
+            new_messages.push(user_message);
+        }
+
+        let _ = tx.send(ApiEvent::Done { new_messages });
+    }
+
+    /// Sends the conversation so far and streams one reply, forwarding
+    /// `TextDelta`/`ToolUse`/`ToolResult` events as they arrive. Returns the
+    /// finished content blocks and stop reason, or `None` if something went
+    /// wrong (in which case an `ApiEvent::Error` was already sent).
+    async fn stream_once(
+        &self,
+        messages: &[Value],
+        local_tool_defs: &[Value],
+        tx: &UnboundedSender<ApiEvent>,
+    ) -> Option<StepResult> {
+        let body = self.build_body(messages, local_tool_defs);
 
         let response = match self
             .http
@@ -92,7 +187,7 @@ impl ClaudeClient {
             Ok(resp) => resp,
             Err(e) => {
                 let _ = tx.send(ApiEvent::Error(format!("request failed: {e}")));
-                return;
+                return None;
             }
         };
 
@@ -103,7 +198,7 @@ impl ClaudeClient {
                 .await
                 .unwrap_or_else(|_| "<no body>".to_string());
             let _ = tx.send(ApiEvent::Error(format!("API error {status}: {text}")));
-            return;
+            return None;
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -119,13 +214,14 @@ impl ClaudeClient {
         let mut current_text = String::new();
         let mut current_signature = String::new();
         let mut current_partial_json = String::new();
+        let mut stop_reason = String::from("end_turn");
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(ApiEvent::Error(format!("stream error: {e}")));
-                    return;
+                    return None;
                 }
             };
             buf.push_str(&String::from_utf8_lossy(&chunk));
@@ -151,7 +247,7 @@ impl ClaudeClient {
                         let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
 
                         match block_type {
-                            "mcp_tool_use" => {
+                            "mcp_tool_use" | "tool_use" => {
                                 let name = block
                                     .get("name")
                                     .and_then(Value::as_str)
@@ -238,6 +334,15 @@ impl ClaudeClient {
                         current_signature.clear();
                         current_partial_json.clear();
                     }
+                    "message_delta" => {
+                        if let Some(sr) = event
+                            .get("delta")
+                            .and_then(|d| d.get("stop_reason"))
+                            .and_then(Value::as_str)
+                        {
+                            stop_reason = sr.to_string();
+                        }
+                    }
                     "error" => {
                         let msg = event
                             .get("error")
@@ -246,13 +351,13 @@ impl ClaudeClient {
                             .unwrap_or("unknown error")
                             .to_string();
                         let _ = tx.send(ApiEvent::Error(msg));
-                        return;
+                        return None;
                     }
                     "message_stop" => {
-                        let _ = tx.send(ApiEvent::Done {
-                            content: finished_blocks.clone(),
+                        return Some(StepResult {
+                            content: finished_blocks,
+                            stop_reason,
                         });
-                        return;
                     }
                     _ => {}
                 }
@@ -261,8 +366,9 @@ impl ClaudeClient {
 
         // Stream ended without an explicit message_stop (shouldn't normally
         // happen, but don't leave the UI hanging).
-        let _ = tx.send(ApiEvent::Done {
+        Some(StepResult {
             content: finished_blocks,
-        });
+            stop_reason,
+        })
     }
 }

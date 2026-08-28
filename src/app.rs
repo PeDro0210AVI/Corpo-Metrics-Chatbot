@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 
 use crate::claude::ApiEvent;
 use crate::config::Config;
+use crate::local_mcp::LocalMcpRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -36,12 +37,24 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: &Config) -> Self {
-        Self {
-            header: format!(
+    pub fn new(config: &Config, local: &LocalMcpRegistry) -> Self {
+        let local_names = local.connected_names();
+        let header = if local_names.is_empty() {
+            format!(
                 "corpo-metrics-chatbot — model: {} — mcp: {}",
                 config.model, config.mcp_server_url
-            ),
+            )
+        } else {
+            format!(
+                "corpo-metrics-chatbot — model: {} — mcp: {} + local[{}]",
+                config.model,
+                config.mcp_server_url,
+                local_names.join(", ")
+            )
+        };
+
+        Self {
+            header,
             history: Vec::new(),
             display: vec![DisplayMessage {
                 role: Role::System,
@@ -122,11 +135,10 @@ impl App {
                     },
                 });
             }
-            ApiEvent::Done { content } => {
-                if !content.is_empty() {
-                    self.history
-                        .push(json!({"role": "assistant", "content": content}));
-                }
+            ApiEvent::Done { new_messages } => {
+                // May be more than one assistant/user pair if the turn
+                // involved client-side (local MCP) tool round trips.
+                self.history.extend(new_messages);
                 self.is_streaming = false;
                 self.open_text_idx = None;
                 self.status = None;
