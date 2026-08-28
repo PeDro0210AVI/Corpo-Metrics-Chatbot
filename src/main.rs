@@ -1,6 +1,7 @@
 mod app;
 mod claude;
 mod config;
+mod ui;
 
 use config::Config;
 
