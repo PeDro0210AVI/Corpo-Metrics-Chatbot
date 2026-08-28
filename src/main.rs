@@ -1,6 +1,7 @@
 mod app;
 mod claude;
 mod config;
+mod local_mcp;
 mod ui;
 
 use std::io;
