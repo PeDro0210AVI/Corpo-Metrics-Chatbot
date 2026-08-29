@@ -20,6 +20,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use app::App;
 use claude::{ApiEvent, ClaudeClient};
 use config::Config;
+use local_mcp::LocalMcpRegistry;
 
 /// Everything the main loop can react to: a terminal input event, or a
 /// streamed chunk from an in-flight Claude API call.
@@ -33,13 +34,18 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
     let client = Arc::new(ClaudeClient::new(&config));
 
+    // Spawn local (stdio) MCP servers — filesystem, git — before touching
+    // the terminal, so any "connected"/"unavailable" messages print
+    // normally instead of getting lost in the alternate screen.
+    let local = Arc::new(LocalMcpRegistry::connect(config.local_mcp_servers()).await);
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &config, client).await;
+    let result = run(&mut terminal, &config, client, local).await;
 
     disable_raw_mode()?;
     execute!(
@@ -56,11 +62,9 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config: &Config,
     client: Arc<ClaudeClient>,
+    local: Arc<LocalMcpRegistry>,
 ) -> Result<()> {
-    // TODO: connect the real local servers at startup instead of an empty
-    // placeholder — comes with the rest of the startup wiring.
-    let placeholder_local = local_mcp::LocalMcpRegistry::connect(vec![]).await;
-    let mut app = App::new(config, &placeholder_local);
+    let mut app = App::new(config, &local);
 
     let (tx, mut rx) = unbounded_channel::<LoopEvent>();
 
@@ -89,7 +93,7 @@ async fn run(
 
         match loop_event {
             LoopEvent::Term(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                handle_key(key.code, key.modifiers, &mut app, &tx, &client);
+                handle_key(key.code, key.modifiers, &mut app, &tx, &client, &local);
             }
             LoopEvent::Term(_) => {}
             LoopEvent::Api(event) => app.handle_api_event(event),
@@ -109,6 +113,7 @@ fn handle_key(
     app: &mut App,
     tx: &UnboundedSender<LoopEvent>,
     client: &Arc<ClaudeClient>,
+    local: &Arc<LocalMcpRegistry>,
 ) {
     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
         app.should_quit = true;
@@ -119,7 +124,7 @@ fn handle_key(
         KeyCode::Esc => app.should_quit = true,
         KeyCode::Enter => {
             if let Some(history) = app.submit_input() {
-                spawn_request(history, tx.clone(), client.clone());
+                spawn_request(history, tx.clone(), client.clone(), local.clone());
             }
         }
         KeyCode::Backspace => {
@@ -147,15 +152,12 @@ fn spawn_request(
     history: Vec<serde_json::Value>,
     tx: UnboundedSender<LoopEvent>,
     client: Arc<ClaudeClient>,
+    local: Arc<LocalMcpRegistry>,
 ) {
     tokio::spawn(async move {
         let (api_tx, mut api_rx) = unbounded_channel::<ApiEvent>();
 
         tokio::spawn(async move {
-            // TODO: thread a shared registry through from startup instead of
-            // reconnecting per request (empty specs here means no local
-            // tools yet — this just gets the new call site compiling).
-            let local = local_mcp::LocalMcpRegistry::connect(vec![]).await;
             client.run_turn(history, &local, api_tx).await;
         });
 
