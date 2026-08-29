@@ -67,15 +67,33 @@
             let
               craneLib = crane.mkLib pkgs;
               lib = pkgs.lib;
-            in
-            craneLib.buildPackage {
-              inherit nativeBuildInputs buildInputs;
-              src = ./.;
 
-              env = {
-                RUSTFLAGS = "-C link-args=-Wl,-rpath,${lib.makeLibraryPath buildInputs}";
+              # The local filesystem/git MCP servers are spawned at runtime
+              # via `npx`/`uvx` — make sure they're on PATH for the built
+              # binary too, not just inside `nix develop`.
+              runtimeTools = with pkgs; [
+                nodejs
+                uv
+              ];
+
+              rawPackage = craneLib.buildPackage {
+                inherit nativeBuildInputs buildInputs;
+                src = ./.;
+
+                env = {
+                  RUSTFLAGS = "-C link-args=-Wl,-rpath,${lib.makeLibraryPath buildInputs}";
+                };
+
               };
-
+            in
+            pkgs.symlinkJoin {
+              name = "corpo-metrics-chatbot";
+              paths = [ rawPackage ];
+              nativeBuildInputs = [ pkgs.makeWrapper ];
+              postBuild = ''
+                wrapProgram $out/bin/corpo-metrics-chatbot \
+                  --prefix PATH : ${lib.makeBinPath runtimeTools}
+              '';
             };
         }
       );
@@ -103,6 +121,11 @@
                 clippy
                 rustfmt
                 taplo # lsp for cargo.toml
+
+                # local MCP servers spawned at runtime (filesystem via
+                # `npx`, git via `uvx`)
+                nodejs
+                uv
 
                 claude-code # the demon itself
               ];
